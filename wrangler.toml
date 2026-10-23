@@ -1,0 +1,6 @@
+name = "hunter-lead-worker"
+main = "src/index.js"
+compatibility_date = "2026-10-23"
+
+[vars]
+COMPOSIO_HUNTER_VERSION = "20261018_00"
