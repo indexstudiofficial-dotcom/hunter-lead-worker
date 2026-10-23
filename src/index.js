@@ -1,5 +1,4 @@
 // ============================================================
-// HUNTER LEAD WORKER
 // Trigger: Supabase Cron POST request
 // Authentication: No CRON_SECRET
 // ============================================================
