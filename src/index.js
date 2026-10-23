@@ -1,16 +1,35 @@
 // ============================================================
-// Trigger: Supabase Cron POST request
-// Authentication: No CRON_SECRET
+// HUNTER LEAD WORKER
+//
+// Trigger: Supabase Cron sends POST
+// No CRON_SECRET
+//
+// Workflow:
+// 1. Find oldest pending outreach task.
+// 2. Claim the task.
+// 3. Discover matching companies using Hunter.
+// 4. Perform at most ONE paid Domain Search.
+// 5. Select one suitable email.
+// 6. Avoid duplicate leads.
+// 7. Save one lead to Supabase.
+// 8. Decrease pending_count after a new lead is saved.
+// 9. Mark task Completed when pending_count reaches zero.
+//
+// Required Cloudflare secrets:
+// SUPABASE_URL
+// SUPABASE_SERVICE_ROLE_KEY
+// COMPOSIO_API_KEY
+//
+// Optional variable:
+// COMPOSIO_HUNTER_VERSION
 // ============================================================
 
 const COMPOSIO_BASE_URL = "https://backend.composio.dev/api/v3.1";
-
-const HUNTER_VERSION = "20261018_00";
-
+const DEFAULT_HUNTER_VERSION = "20261018_00";
 const MAX_COMPANIES_TO_CHECK = 5;
 
 // ============================================================
-// MAIN REQUEST HANDLER
+// HTTP ENTRY POINT
 // ============================================================
 
 export default {
@@ -27,9 +46,9 @@ export default {
 
       const result = await processOneTask(env);
 
-      return json(result, 200);
+      return json(result);
     } catch (error) {
-      console.error("Worker error:", error.message);
+      console.error("Worker failed:", error.message);
 
       return json({
         ok: false,
@@ -40,7 +59,7 @@ export default {
 };
 
 // ============================================================
-// ENVIRONMENT VALIDATION
+// ENVIRONMENT
 // ============================================================
 
 function validateEnvironment(env) {
@@ -50,38 +69,84 @@ function validateEnvironment(env) {
     "COMPOSIO_API_KEY",
   ];
 
-  for (const key of required) {
-    if (!env[key]) {
-      throw new Error(`Missing environment variable: ${key}`);
+  for (const name of required) {
+    if (!env[name]) {
+      throw new Error(`Missing environment variable: ${name}`);
     }
   }
 }
 
+function getHunterVersion(env) {
+  return env.COMPOSIO_HUNTER_VERSION || DEFAULT_HUNTER_VERSION;
+}
+
 // ============================================================
-// MAIN TASK PROCESSOR
+// SUPABASE REST HELPER
+// ============================================================
+
+async function supabaseRequest(env, path, options = {}) {
+  const base = env.SUPABASE_URL.replace(/\/+$/, "");
+
+  const response = await fetch(`${base}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+  const raw = await response.text();
+  let data = null;
+
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = raw;
+    }
+  }
+
+  if (!response.ok) {
+    console.error(
+      "Supabase request failed:",
+      response.status,
+      JSON.stringify(data).slice(0, 1200)
+    );
+
+    throw new Error(`Supabase request failed: HTTP ${response.status}`);
+  }
+
+  return {
+    data,
+    headers: response.headers,
+  };
+}
+
+// ============================================================
+// PROCESS ONE TASK
 // ============================================================
 
 async function processOneTask(env) {
-  // Find the oldest pending outreach task.
   const task = await findOldestPendingTask(env);
 
   if (!task) {
     return {
       ok: true,
-      message: "No pending outreach tasks",
       processed: false,
+      message: "No pending outreach tasks",
     };
   }
 
-  // Attempt to claim the task.
-  // Only one request should successfully change pending to Processing.
   const claimed = await claimTask(env, task);
 
   if (!claimed) {
     return {
       ok: true,
-      message: "Task was already claimed by another worker",
       processed: false,
+      message: "Task was already claimed",
+      task_id: task.id,
     };
   }
 
@@ -100,7 +165,6 @@ async function processOneTask(env) {
       };
     }
 
-    // Decrease pending_count only after a successful lead insert.
     const updatedTask = await decrementPendingCount(env, task);
 
     return {
@@ -109,60 +173,16 @@ async function processOneTask(env) {
       task_id: task.id,
       lead: result.lead,
       pending_count: updatedTask.pending_count,
-      task_status: updatedTask.status,
+      status: updatedTask.status,
     };
   } catch (error) {
-    // Leave the task retryable after a failure.
     await releaseTask(env, task.id, error.message);
-
     throw error;
   }
 }
 
 // ============================================================
-// SUPABASE REST HELPERS
-// ============================================================
-
-async function supabaseRequest(env, path, options = {}) {
-  const baseUrl = env.SUPABASE_URL.replace(/\/+$/, "");
-
-  const response = await fetch(`${baseUrl}/rest/v1/${path}`, {
-    ...options,
-
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
-
-  const text = await response.text();
-
-  let data = null;
-
-  if (text) {
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = text;
-    }
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `Supabase error ${response.status}: ${JSON.stringify(data)}`
-    );
-  }
-
-  return {
-    data,
-    headers: response.headers,
-  };
-}
-
-// ============================================================
-// FIND OLDEST PENDING TASK
+// FIND OLDEST PENDING OUTREACH TASK
 // ============================================================
 
 async function findOldestPendingTask(env) {
@@ -191,16 +211,15 @@ async function findOldestPendingTask(env) {
 
 async function claimTask(env, task) {
   const query =
-    `planner_runs?id=eq.${encodeURIComponent(task.id)}` +
+    "planner_runs" +
+    `?id=eq.${encodeURIComponent(task.id)}` +
     "&status=eq.pending";
 
   const result = await supabaseRequest(env, query, {
     method: "PATCH",
-
     headers: {
       Prefer: "return=representation",
     },
-
     body: JSON.stringify({
       status: "Processing",
       started_at: new Date().toISOString(),
@@ -217,99 +236,80 @@ async function claimTask(env, task) {
 
 async function releaseTask(env, taskId, reason) {
   const query =
-    `planner_runs?id=eq.${encodeURIComponent(taskId)}` +
+    "planner_runs" +
+    `?id=eq.${encodeURIComponent(taskId)}` +
     "&status=eq.Processing";
 
   await supabaseRequest(env, query, {
     method: "PATCH",
-
     body: JSON.stringify({
       status: "pending",
-      error: String(reason).slice(0, 2000),
+      error: String(reason || "Unknown error").slice(0, 2000),
     }),
   });
 }
 
 // ============================================================
-// DISCOVER COMPANIES AND FIND ONE LEAD
+// FIND AND SAVE ONE LEAD
 // ============================================================
 
 async function findAndSaveOneLead(env, task) {
-  // Step 1: Free Hunter company discovery.
+  // Free discovery step.
   const companies = await discoverCompanies(env, task);
 
-  if (companies.length === 0) {
+  if (!companies.length) {
     return {
       saved: false,
-      reason: "No matching companies found",
+      reason: "Hunter discovery returned no usable companies",
     };
   }
 
-  // Step 2: Try up to five companies.
-  // A maximum of ONE paid Domain Search is allowed per run.
-  //
-  // We only make the paid call for the first company that has
-  // a usable domain. We do not make another paid search if it
-  // returns no suitable email.
-  let selectedCompany = null;
+  let company = null;
 
-  for (const company of companies.slice(0, MAX_COMPANIES_TO_CHECK)) {
-    const domain = getCompanyDomain(company);
+  for (const item of companies.slice(0, MAX_COMPANIES_TO_CHECK)) {
+    const domain = getCompanyDomain(item);
 
     if (domain) {
-      selectedCompany = {
-        ...company,
+      company = {
+        ...item,
         domain,
       };
-
       break;
     }
   }
 
-  if (!selectedCompany) {
+  if (!company) {
     return {
       saved: false,
-      reason: "No company with a usable domain was found",
+      reason: "No discovered company had a usable domain",
     };
   }
 
-  // Step 3: One paid Domain Search at most.
-  const domainResult = await searchDomain(
-    env,
-    selectedCompany.domain,
-    task
-  );
+  // Exactly one paid Domain Search call at most per worker run.
+  const domainResult = await searchDomain(env, company.domain, task);
 
-  // Step 4: Extract email candidates.
-  const candidates = extractEmailCandidates(domainResult);
-
-  if (candidates.length === 0) {
-    return {
-      saved: false,
-      reason: "Domain Search returned no usable email candidates",
-    };
-  }
-
-  // Step 5: Rank candidates for the niche.
-  const rankedCandidates = candidates
+  const candidates = extractEmailCandidates(domainResult)
     .filter((candidate) => isValidEmail(candidate.email))
     .sort((a, b) => scoreCandidate(b, task) - scoreCandidate(a, task));
 
-  // Step 6: Save the first suitable, non-duplicate lead.
-  for (const candidate of rankedCandidates) {
+  if (!candidates.length) {
+    return {
+      saved: false,
+      reason: "Domain Search returned no usable email addresses",
+    };
+  }
+
+  for (const candidate of candidates) {
     const email = candidate.email.trim().toLowerCase();
 
-    const exists = await leadEmailExists(
-      env,
-      task.application_id,
-      email
-    );
-
-    if (exists) {
+    if (await leadEmailExists(env, task.application_id, email)) {
       continue;
     }
 
-    const lead = buildLead(task, selectedCompany, candidate);
+    const lead = buildLead(task, company, {
+      ...candidate,
+      email,
+    });
 
     const inserted = await insertLead(env, lead);
 
@@ -328,31 +328,54 @@ async function findAndSaveOneLead(env, task) {
 
   return {
     saved: false,
-    reason: "No new suitable email was found",
+    reason: "All returned email addresses were duplicates",
   };
 }
 
 // ============================================================
-// HUNTER: COMPANY DISCOVERY
+// HUNTER COMPANY DISCOVERY
+//
+// FIX:
+// Do not pass a free-form industry filter to Hunter.
+// Ask for niche-relevant companies without specifying an
+// arbitrary industry value.
+//
+// NOTE:
+// This uses Composio's text execution mode. If your exact
+// Composio tool requires structured arguments, its schema
+// must be used instead.
 // ============================================================
 
 async function discoverCompanies(env, task) {
+  const niche = String(task.niche || "B2B companies").slice(0, 300);
+  const taskInstructions = String(task.task || "").slice(0, 5000);
+
   const prompt = `
-Find companies matching this lead-generation task.
+Discover companies relevant to this business niche.
 
-TASK:
-${task.task || ""}
+Target niche:
+${niche}
 
-TARGET NICHE:
-${task.niche || ""}
+Additional requirements:
+${taskInstructions}
 
-Requirements:
-- Prefer companies that match the requested industry and niche.
-- Respect the requested country and company size when possible.
-- Return companies with their name, domain, website, industry,
-  employee count, country, and city when available.
-- Return structured company results.
-- Do not invent companies or domains.
+Return available company information, including:
+- Company name
+- Company domain
+- Website
+- Industry
+- Employee count
+- Country
+- City
+
+Important:
+- Find real companies only.
+- Do not invent company names or domains.
+- Do not use an unsupported or invented industry filter.
+- Treat the niche as a search description, not an industry enum.
+- Prefer companies matching the country, size, and audience
+  described in the task.
+- Return structured company results if available.
 `;
 
   const response = await executeHunterTool(
@@ -365,35 +388,37 @@ Requirements:
 }
 
 // ============================================================
-// HUNTER: DOMAIN SEARCH
+// HUNTER DOMAIN SEARCH
 // ============================================================
 
 async function searchDomain(env, domain, task) {
   const prompt = `
-Search Hunter for professional email addresses at this company.
+Find professional email addresses for people at this company.
 
-Company domain: ${domain}
+Company domain:
+${domain}
 
 Target niche:
-${task.niche || ""}
+${String(task.niche || "").slice(0, 300)}
 
-Task requirements:
-${task.task || ""}
+Requirements:
+${String(task.task || "").slice(0, 3000)}
 
-Return available email candidates with:
-- email
-- first name
-- last name
-- full name
-- job title
-- email verification status
-- LinkedIn URL if available
+Return available information:
+- Email address
+- First name
+- Last name
+- Full name
+- Job title
+- Email verification status
+- LinkedIn URL, if available
 
-Prefer relevant decision-makers for the target niche.
-Return only data supplied by Hunter. Do not invent email addresses.
+Prefer people whose roles match the target audience.
+Only return information supplied by Hunter.
+Do not invent email addresses.
 `;
 
-  return await executeHunterTool(
+  return executeHunterTool(
     env,
     "HUNTER_DOMAIN_SEARCH",
     prompt
@@ -401,50 +426,49 @@ Return only data supplied by Hunter. Do not invent email addresses.
 }
 
 // ============================================================
-// COMPOSIO INSTANT TOOL EXECUTION
+// COMPOSIO EXECUTION
 // ============================================================
 
 async function executeHunterTool(env, toolSlug, text) {
   const response = await fetch(
-    `${COMPOSIO_BASE_URL}/tools/execute/${toolSlug}`,
+    `${COMPOSIO_BASE_URL}/tools/execute/${encodeURIComponent(toolSlug)}`,
     {
       method: "POST",
-
       headers: {
         "x-api-key": env.COMPOSIO_API_KEY,
         "Content-Type": "application/json",
       },
-
       body: JSON.stringify({
         connected_account_id: "instant_account",
-        version: HUNTER_VERSION,
+        version: getHunterVersion(env),
         text,
       }),
     }
   );
 
   const raw = await response.text();
-
   let data;
 
   try {
     data = raw ? JSON.parse(raw) : {};
   } catch {
     throw new Error(
-      `Composio returned a non-JSON response for ${toolSlug}`
+      `Composio returned non-JSON output for ${toolSlug}: ` +
+      raw.slice(0, 500)
     );
   }
 
   if (!response.ok) {
     throw new Error(
-      `Composio ${toolSlug} failed (${response.status}): ` +
-      JSON.stringify(data).slice(0, 1500)
+      `Composio ${toolSlug} failed with HTTP ${response.status}: ` +
+      JSON.stringify(data).slice(0, 1200)
     );
   }
 
   if (data.error) {
     throw new Error(
-      `Composio ${toolSlug} error: ${JSON.stringify(data.error)}`
+      `Composio ${toolSlug} error: ` +
+      JSON.stringify(data.error).slice(0, 1200)
     );
   }
 
@@ -452,73 +476,11 @@ async function executeHunterTool(env, toolSlug, text) {
 }
 
 // ============================================================
-// EXTRACT COMPANIES FROM COMPOSIO RESPONSE
+// EXTRACT COMPANIES
 // ============================================================
 
 function extractCompanies(response) {
-  const results = [];
-  const seen = new Set();
-
-  function walk(value, depth = 0) {
-    if (!value || depth > 8) return;
-
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        walk(item, depth + 1);
-      }
-
-      return;
-    }
-
-    if (typeof value !== "object") return;
-
-    const domain = getCompanyDomain(value);
-    const name =
-      value.company_name ||
-      value.company ||
-      value.name ||
-      value.organization_name;
-
-    if (domain && name) {
-      const key = domain.toLowerCase();
-
-      if (!seen.has(key)) {
-        seen.add(key);
-
-        results.push({
-          name: String(name),
-          domain,
-          website: value.website || value.company_website || null,
-          industry: value.industry || value.company_industry || null,
-          size:
-            value.employee_count ||
-            value.company_size ||
-            value.employees ||
-            null,
-          country: value.country || value.company_country || null,
-          city: value.city || value.company_city || null,
-        });
-      }
-    }
-
-    for (const [key, child] of Object.entries(value)) {
-      if (typeof child === "object" && child !== null) {
-        walk(child, depth + 1);
-      }
-    }
-  }
-
-  walk(response);
-
-  return results;
-}
-
-// ============================================================
-// EXTRACT EMAIL CANDIDATES FROM HUNTER RESPONSE
-// ============================================================
-
-function extractEmailCandidates(response) {
-  const results = [];
+  const companies = [];
   const seen = new Set();
 
   function walk(value, depth = 0) {
@@ -528,30 +490,103 @@ function extractEmailCandidates(response) {
       for (const item of value) {
         walk(item, depth + 1);
       }
-
       return;
     }
 
     if (typeof value !== "object") return;
 
-    const possibleEmail =
+    const name =
+      value.company_name ||
+      value.company ||
+      value.organization_name ||
+      value.name;
+
+    const domain = getCompanyDomain(value);
+
+    if (name && domain) {
+      if (!seen.has(domain)) {
+        seen.add(domain);
+
+        companies.push({
+          name: String(name),
+          domain,
+          website:
+            value.website ||
+            value.company_website ||
+            null,
+          industry:
+            value.industry ||
+            value.company_industry ||
+            null,
+          size:
+            value.employee_count ??
+            value.company_size ??
+            value.employees ??
+            null,
+          country:
+            value.country ||
+            value.company_country ||
+            null,
+          city:
+            value.city ||
+            value.company_city ||
+            null,
+        });
+      }
+    }
+
+    for (const child of Object.values(value)) {
+      if (child && typeof child === "object") {
+        walk(child, depth + 1);
+      }
+    }
+  }
+
+  walk(response);
+  return companies;
+}
+
+// ============================================================
+// EXTRACT EMAIL CANDIDATES
+// ============================================================
+
+function extractEmailCandidates(response) {
+  const candidates = [];
+  const seen = new Set();
+
+  function walk(value, depth = 0) {
+    if (!value || depth > 12) return;
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        walk(item, depth + 1);
+      }
+      return;
+    }
+
+    if (typeof value !== "object") return;
+
+    const email =
       value.value ||
       value.email ||
       value.email_address;
 
-    if (
-      typeof possibleEmail === "string" &&
-      isValidEmail(possibleEmail)
-    ) {
-      const email = possibleEmail.trim().toLowerCase();
+    if (typeof email === "string" && isValidEmail(email)) {
+      const normalized = email.trim().toLowerCase();
 
-      if (!seen.has(email)) {
-        seen.add(email);
+      if (!seen.has(normalized)) {
+        seen.add(normalized);
 
-        results.push({
-          email,
-          first_name: value.first_name || value.firstName || null,
-          last_name: value.last_name || value.lastName || null,
+        candidates.push({
+          email: normalized,
+          first_name:
+            value.first_name ||
+            value.firstName ||
+            null,
+          last_name:
+            value.last_name ||
+            value.lastName ||
+            null,
           full_name:
             value.full_name ||
             value.name ||
@@ -575,45 +610,42 @@ function extractEmailCandidates(response) {
     }
 
     for (const child of Object.values(value)) {
-      if (typeof child === "object" && child !== null) {
+      if (child && typeof child === "object") {
         walk(child, depth + 1);
       }
     }
   }
 
   walk(response);
-
-  return results;
+  return candidates;
 }
 
 // ============================================================
-// COMPANY DOMAIN HELPERS
+// NORMALIZE COMPANY DOMAIN
 // ============================================================
 
 function getCompanyDomain(company) {
-  let domain =
+  let value =
     company.domain ||
     company.company_domain ||
     company.website ||
     company.company_website ||
     null;
 
-  if (!domain || typeof domain !== "string") {
+  if (typeof value !== "string" || !value.trim()) {
     return null;
   }
 
-  domain = domain.trim();
-
-  if (!domain) return null;
+  value = value.trim();
 
   try {
-    if (!domain.startsWith("http://") &&
-        !domain.startsWith("https://")) {
-      domain = `https://${domain}`;
+    if (!/^https?:\/\//i.test(value)) {
+      value = `https://${value}`;
     }
 
-    const url = new URL(domain);
-    const hostname = url.hostname.toLowerCase();
+    const hostname = new URL(value).hostname
+      .toLowerCase()
+      .replace(/^www\./, "");
 
     if (
       !hostname.includes(".") ||
@@ -623,24 +655,22 @@ function getCompanyDomain(company) {
       return null;
     }
 
-    return hostname.replace(/^www\./, "");
+    return hostname;
   } catch {
     return null;
   }
 }
 
 // ============================================================
-// EMAIL HELPERS
+// EMAIL VALIDATION
 // ============================================================
 
 function isValidEmail(email) {
-  if (typeof email !== "string") return false;
+  if (typeof email !== "string" || email.length > 254) {
+    return false;
+  }
 
-  const normalized = email.trim();
-
-  if (normalized.length > 254) return false;
-
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
 }
 
 function joinName(first, last) {
@@ -648,53 +678,43 @@ function joinName(first, last) {
 }
 
 // ============================================================
-// CANDIDATE SCORING
+// SIMPLE LEAD RELEVANCE SCORING
 // ============================================================
 
 function scoreCandidate(candidate, task) {
   let score = 0;
 
   const title = String(candidate.job_title || "").toLowerCase();
-  const emailStatus = String(
-    candidate.email_status || ""
-  ).toLowerCase();
-
+  const status = String(candidate.email_status || "").toLowerCase();
   const taskText = String(task.task || "").toLowerCase();
+  const niche = String(task.niche || "").toLowerCase();
 
-  if (
-    emailStatus.includes("valid") ||
-    emailStatus.includes("verified")
-  ) {
+  if (status === "valid" || status === "verified") {
     score += 10;
   }
 
-  if (
-    emailStatus.includes("invalid") ||
-    emailStatus.includes("disposable")
-  ) {
-    score -= 20;
+  if (status === "invalid" || status === "disposable") {
+    score -= 30;
   }
 
-  const seniorityTerms = [
+  const titles = [
     "founder",
-    "chief",
     "ceo",
+    "chief",
     "owner",
-    "president",
-    "vice president",
-    " vp ",
     "head of",
     "director",
+    "vice president",
+    " vp ",
   ];
 
-  for (const term of seniorityTerms) {
-    if (title.includes(term.trim())) {
-      score += 3;
+  for (const word of titles) {
+    if (title.includes(word.trim())) {
+      score += 2;
     }
   }
 
-  // Add points if the job title relates to the task's niche.
-  const relevantTerms = [
+  const relevantWords = [
     "growth",
     "marketing",
     "sales",
@@ -704,8 +724,11 @@ function scoreCandidate(candidate, task) {
     "operations",
   ];
 
-  for (const term of relevantTerms) {
-    if (title.includes(term) && taskText.includes(term)) {
+  for (const word of relevantWords) {
+    if (
+      title.includes(word) &&
+      (taskText.includes(word) || niche.includes(word))
+    ) {
       score += 5;
     }
   }
@@ -714,7 +737,7 @@ function scoreCandidate(candidate, task) {
 }
 
 // ============================================================
-// CHECK FOR DUPLICATE LEADS
+// DUPLICATE EMAIL CHECK
 // ============================================================
 
 async function leadEmailExists(env, applicationId, email) {
@@ -731,7 +754,7 @@ async function leadEmailExists(env, applicationId, email) {
 }
 
 // ============================================================
-// BUILD LEAD RECORD
+// BUILD LEAD ROW
 // ============================================================
 
 function buildLead(task, company, candidate) {
@@ -745,33 +768,30 @@ function buildLead(task, company, candidate) {
 
     first_name: firstName,
     last_name: lastName,
-
     full_name:
       candidate.full_name ||
       joinName(firstName, lastName),
 
     email: candidate.email.trim().toLowerCase(),
-    email_status: candidate.email_status,
+    email_status: candidate.email_status || null,
+    job_title: candidate.job_title || null,
+    linkedin_url: candidate.linkedin_url || null,
 
-    job_title: candidate.job_title,
-    linkedin_url: candidate.linkedin_url,
-
-    company_name: company.name,
-    company_domain: company.domain,
+    company_name: company.name || null,
+    company_domain: company.domain || null,
     company_website:
       company.website ||
       `https://${company.domain}`,
 
-    company_industry: company.industry,
+    company_industry: company.industry || null,
     company_size:
       company.size === null || company.size === undefined
         ? null
         : String(company.size),
 
-    company_country: company.country,
-    company_city: company.city,
+    company_country: company.country || null,
+    company_city: company.city || null,
 
-    // User requested no generated message yet.
     message: null,
     reply_status: "pending",
   };
@@ -784,11 +804,9 @@ function buildLead(task, company, candidate) {
 async function insertLead(env, lead) {
   const result = await supabaseRequest(env, "leads", {
     method: "POST",
-
     headers: {
       Prefer: "return=representation",
     },
-
     body: JSON.stringify(lead),
   });
 
@@ -796,26 +814,28 @@ async function insertLead(env, lead) {
 }
 
 // ============================================================
-// DECREASE TASK PENDING COUNT
+// DECREMENT PENDING COUNT
+//
+// IMPORTANT:
+// This is a basic read-and-update implementation.
+// For strict production safety, move lead insertion and
+// pending_count decrement into one atomic PostgreSQL function.
 // ============================================================
 
 async function decrementPendingCount(env, task) {
-  // Re-read the latest task values before updating.
   const readQuery =
     "planner_runs" +
-    "?select=id,pending_count,status" +
+    "?select=id,pending_count" +
     `&id=eq.${encodeURIComponent(task.id)}` +
     "&limit=1";
 
   const read = await supabaseRequest(env, readQuery);
 
-  if (!Array.isArray(read.data) || read.data.length === 0) {
-    throw new Error("Task disappeared after lead insertion");
+  if (!Array.isArray(read.data) || !read.data.length) {
+    throw new Error("Task not found while updating pending_count");
   }
 
-  const current = read.data[0];
-  const currentCount = Number(current.pending_count || 0);
-
+  const currentCount = Number(read.data[0].pending_count || 0);
   const nextCount = Math.max(0, currentCount - 1);
 
   const nextStatus = nextCount === 0
@@ -823,15 +843,14 @@ async function decrementPendingCount(env, task) {
     : "pending";
 
   const updateQuery =
-    `planner_runs?id=eq.${encodeURIComponent(task.id)}`;
+    "planner_runs" +
+    `?id=eq.${encodeURIComponent(task.id)}`;
 
   const updated = await supabaseRequest(env, updateQuery, {
     method: "PATCH",
-
     headers: {
       Prefer: "return=representation",
     },
-
     body: JSON.stringify({
       pending_count: nextCount,
       status: nextStatus,
@@ -839,8 +858,8 @@ async function decrementPendingCount(env, task) {
     }),
   });
 
-  if (!Array.isArray(updated.data) || updated.data.length === 0) {
-    throw new Error("Could not update task pending_count");
+  if (!Array.isArray(updated.data) || !updated.data.length) {
+    throw new Error("Could not update pending_count");
   }
 
   return updated.data[0];
@@ -853,10 +872,9 @@ async function decrementPendingCount(env, task) {
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
     },
   });
-        }
+                                  }
