@@ -646,11 +646,11 @@ async function searchDomain(env, domain, filters) {
 
   if (useFilters) {
     if (filters.seniority.length) {
-      args.seniority = filters.seniority.join(",");
+      args.seniority = filters.seniority;
     }
 
     if (filters.departments.length) {
-      args.department = filters.departments.join(",");
+      args.department = filters.departments;
     }
   }
 
