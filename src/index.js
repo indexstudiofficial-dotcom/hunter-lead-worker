@@ -9,7 +9,8 @@
 // 3.  Parse the task text into structured filters.
 // 4.  Discover matching companies using Hunter (free).
 // 5.  Pick one company not already used for this application.
-// 6.  Perform at most ONE paid Domain Search.
+// 6.  Domain Search companies one by one (max 6 calls) until
+//     a new email is found.
 // 7.  Select one suitable email and avoid duplicates.
 // 8.  Save one lead to Supabase.
 // 9.  Decrease pending_count after a new lead is saved.
@@ -28,6 +29,7 @@
 const COMPOSIO_BASE_URL = "https://backend.composio.dev/api/v3.1";
 const DISCOVER_LIMIT = 25;
 const DOMAIN_SEARCH_LIMIT = 10;
+const MAX_DOMAIN_SEARCHES = 6; // max Domain Search calls per worker run
 
 // ============================================================
 // HTTP ENTRY POINT
@@ -400,65 +402,105 @@ async function findAndSaveOneLead(env, task) {
     };
   }
 
-  const company = await pickCompany(env, task, companies);
+  const ranked = await pickCompany(env, task, companies);
 
-  if (!company) {
+  if (!ranked.length) {
     return {
       saved: false,
       reason: "All discovered companies were already used or had no emails",
     };
   }
 
-  // Exactly one paid Domain Search call at most per worker run.
-  const domainResult = await searchDomain(env, company.domain, filters);
+  // Try companies one by one until a new email is saved.
+  // Hunter only charges when emails are actually returned, so empty
+  // searches are free. MAX_DOMAIN_SEARCHES caps the total calls per run.
+  let searches = 0;
+  const tried = [];
 
-  const candidates = extractEmailCandidates(domainResult)
-    .filter((candidate) => isValidEmail(candidate.email))
-    .filter((candidate) => !isBadStatus(candidate.email_status))
-    .sort(
-      (a, b) => scoreCandidate(b, filters) - scoreCandidate(a, filters)
-    );
+  for (const company of ranked) {
+    if (searches >= MAX_DOMAIN_SEARCHES) break;
 
-  if (!candidates.length) {
-    console.error(
-      `Domain Search found no usable emails for ${company.domain}:`,
-      JSON.stringify(domainResult).slice(0, 1500)
-    );
+    // First with the task filters, then once without them.
+    const attempts = hasDomainFilters(env, filters) ? [true, false] : [false];
 
-    return {
-      saved: false,
-      reason: `Domain Search returned no usable email addresses for ${company.domain}`,
-    };
-  }
+    for (const useFilters of attempts) {
+      if (searches >= MAX_DOMAIN_SEARCHES) break;
 
-  for (const candidate of candidates) {
-    const email = candidate.email.trim().toLowerCase();
+      searches++;
 
-    if (await leadEmailExists(env, task.application_id, email)) {
-      continue;
+      let domainResult;
+
+      try {
+        domainResult = await searchDomain(
+          env,
+          company.domain,
+          filters,
+          useFilters
+        );
+      } catch (error) {
+        console.error(
+          `Domain Search failed for ${company.domain}:`,
+          error.message
+        );
+        break;
+      }
+
+      const candidates = extractEmailCandidates(domainResult)
+        .filter((candidate) => isValidEmail(candidate.email))
+        .filter((candidate) => !isBadStatus(candidate.email_status))
+        .sort(
+          (a, b) => scoreCandidate(b, filters) - scoreCandidate(a, filters)
+        );
+
+      if (!candidates.length) {
+        continue;
+      }
+
+      for (const candidate of candidates) {
+        const email = candidate.email.trim().toLowerCase();
+
+        if (await leadEmailExists(env, task.application_id, email)) {
+          continue;
+        }
+
+        const lead = buildLead(task, company, { ...candidate, email });
+        const inserted = await insertLead(env, lead);
+
+        if (inserted) {
+          return {
+            saved: true,
+            lead: {
+              email: lead.email,
+              full_name: lead.full_name,
+              job_title: lead.job_title,
+              company_name: lead.company_name,
+              company_domain: lead.company_domain,
+            },
+          };
+        }
+      }
+
+      // Emails found but all were duplicates: move to the next company.
+      break;
     }
 
-    const lead = buildLead(task, company, { ...candidate, email });
-    const inserted = await insertLead(env, lead);
-
-    if (inserted) {
-      return {
-        saved: true,
-        lead: {
-          email: lead.email,
-          full_name: lead.full_name,
-          job_title: lead.job_title,
-          company_name: lead.company_name,
-          company_domain: lead.company_domain,
-        },
-      };
-    }
+    tried.push(company.domain);
   }
 
   return {
     saved: false,
-    reason: "All returned email addresses were duplicates",
+    reason:
+      `No new email found after ${searches} Domain Search call(s). ` +
+      `Tried: ${tried.join(", ")}`,
   };
+}
+
+function hasDomainFilters(env, filters) {
+  const enabled =
+    String(env.HUNTER_USE_DOMAIN_FILTERS || "true").toLowerCase() !==
+    "false";
+
+  return enabled && (filters.seniority.length || filters.departments.length);
 }
 
 // ============================================================
@@ -472,7 +514,7 @@ async function findAndSaveOneLead(env, task) {
 async function pickCompany(env, task, companies) {
   let pool = companies.filter((company) => company.emailsTotal !== 0);
 
-  if (!pool.length) return null;
+  if (!pool.length) return [];
 
   const usedDomains = await getUsedDomains(
     env,
@@ -482,9 +524,9 @@ async function pickCompany(env, task, companies) {
 
   pool = pool.filter((company) => !usedDomains.has(company.domain));
 
-  if (!pool.length) return null;
+  if (!pool.length) return [];
 
-  return shuffle(pool)[0];
+  return shuffle(pool);
 }
 
 async function getUsedDomains(env, applicationId, domains) {
@@ -628,15 +670,12 @@ async function discoverCompanies(env, filters) {
 // HUNTER DOMAIN SEARCH (paid)
 // ============================================================
 
-async function searchDomain(env, domain, filters) {
+async function searchDomain(env, domain, filters, useFilters = true) {
   const args = {
     domain,
     type: "personal",
     limit: DOMAIN_SEARCH_LIMIT,
   };
-
-  const useFilters = String(env.HUNTER_USE_DOMAIN_FILTERS || "true")
-    .toLowerCase() !== "false";
 
   if (useFilters) {
     if (filters.seniority.length) {
