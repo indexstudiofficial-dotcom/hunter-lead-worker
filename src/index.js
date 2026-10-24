@@ -27,7 +27,6 @@
 // ============================================================
 
 const COMPOSIO_BASE_URL = "https://backend.composio.dev/api/v3.1";
-const DEFAULT_HUNTER_VERSION = "20261018_00";
 const DISCOVER_LIMIT = 25;
 const DOMAIN_SEARCH_LIMIT = 10;
 
@@ -70,8 +69,11 @@ function validateEnvironment(env) {
   }
 }
 
+// Instant accounts always run the latest tool version, so no version
+// is sent unless COMPOSIO_HUNTER_VERSION is set (only needed with
+// your own connected account).
 function getHunterVersion(env) {
-  return env.COMPOSIO_HUNTER_VERSION || DEFAULT_HUNTER_VERSION;
+  return env.COMPOSIO_HUNTER_VERSION || null;
 }
 
 // ============================================================
@@ -672,7 +674,9 @@ async function executeHunterTool(env, toolSlug, args) {
       },
       body: JSON.stringify({
         connected_account_id: "instant_account",
-        version: getHunterVersion(env),
+        ...(getHunterVersion(env)
+          ? { version: getHunterVersion(env) }
+          : {}),
         arguments: args,
       }),
     }
