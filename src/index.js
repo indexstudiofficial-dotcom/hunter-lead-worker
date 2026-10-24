@@ -21,7 +21,6 @@
 //   COMPOSIO_API_KEY
 //
 // Optional variables:
-//   COMPOSIO_HUNTER_VERSION        Composio tool version
 //   HUNTER_USE_DOMAIN_FILTERS      "false" to skip seniority/department
 //                                  filters on Domain Search
 // ============================================================
@@ -67,13 +66,6 @@ function validateEnvironment(env) {
       throw new Error(`Missing environment variable: ${name}`);
     }
   }
-}
-
-// Instant accounts always run the latest tool version, so no version
-// is sent unless COMPOSIO_HUNTER_VERSION is set (only needed with
-// your own connected account).
-function getHunterVersion(env) {
-  return env.COMPOSIO_HUNTER_VERSION || null;
 }
 
 // ============================================================
@@ -674,9 +666,6 @@ async function executeHunterTool(env, toolSlug, args) {
       },
       body: JSON.stringify({
         connected_account_id: "instant_account",
-        ...(getHunterVersion(env)
-          ? { version: getHunterVersion(env) }
-          : {}),
         arguments: args,
       }),
     }
