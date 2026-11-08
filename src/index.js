@@ -3,14 +3,27 @@
 //
 // Trigger: Supabase Cron sends POST
 //
+// Eligibility rules (checked every run, per application):
+//   1. The owner has at least 0.10 credits in users.balance.
+//   2. The application's latest lead (leads.created_at) is more than
+//      12 hours old, or the application has no leads yet.
+//   3. The task has not been attempted in the last 30 minutes
+//      (so one stuck application can't block the others).
+// If no application is eligible, the worker does nothing.
+//
+// Credits: 0.10 is charged when a task is claimed and refunded if no
+// lead is saved, so a user is only charged when a lead is saved.
+//
+// Only VERIFIED emails (Hunter status "valid") are saved.
+//
 // Workflow:
-// 1.  Find oldest pending outreach task.
-// 2.  Claim the task.
+// 1.  Find the oldest eligible pending outreach task.
+// 2.  Charge 0.10 credits and claim the task.
 // 3.  Parse the task text into structured filters.
 // 4.  Discover matching companies using Hunter (free).
 // 5.  Pick one company not already used for this application.
 // 6.  Domain Search companies one by one (max 6 calls) until
-//     a new email is found.
+//     a new VERIFIED email is found.
 // 7.  Select one suitable email and avoid duplicates.
 // 8.  Save one lead to Supabase.
 // 9.  Decrease pending_count after a new lead is saved.
@@ -30,6 +43,25 @@ const COMPOSIO_BASE_URL = "https://backend.composio.dev/api/v3.1";
 const DISCOVER_LIMIT = 25;
 const DOMAIN_SEARCH_LIMIT = 10;
 const MAX_DOMAIN_SEARCHES = 6; // max Domain Search calls per worker run
+
+// ---------- Credits / cooldown ----------
+const CREDIT_COST = 0.1; // charged per lead saved
+const USERS_TABLE = "users";
+const USERS_ID_COLUMN = "id";
+const USERS_BALANCE_COLUMN = "balance";
+
+// An application can only get a new lead when its latest lead is older.
+const LEAD_COOLDOWN_HOURS = 12;
+
+// A task that was just attempted (found nothing / failed) is skipped for
+// this long so other applications get their turn.
+const ATTEMPT_BACKOFF_MINUTES = 30;
+
+// Only emails with these Hunter verification statuses are saved.
+const VERIFIED_STATUSES = ["valid", "verified"];
+
+const MAX_CANDIDATE_TASKS = 300;
+const IN_CHUNK_SIZE = 40;
 
 // ============================================================
 // HTTP ENTRY POINT
@@ -110,36 +142,139 @@ async function supabaseRequest(env, path, options = {}) {
   return { data, headers: response.headers };
 }
 
+// Fetches rows where `column` is in `ids`, in chunks so the URL stays short.
+// `basePath` is a table path with a query string, e.g. "leads?select=id".
+async function fetchInChunks(env, basePath, column, ids) {
+  const rows = [];
+
+  for (let i = 0; i < ids.length; i += IN_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + IN_CHUNK_SIZE);
+
+    const list = chunk
+      .map((id) => `"${String(id).replace(/"/g, "")}"`)
+      .join(",");
+
+    const path =
+      `${basePath}` +
+      `&${column}=in.(${encodeURIComponent(list)})`;
+
+    const result = await supabaseRequest(env, path);
+
+    if (Array.isArray(result.data)) {
+      rows.push(...result.data);
+    }
+  }
+
+  return rows;
+}
+
+// ============================================================
+// CREDITS
+// ============================================================
+
+const round4 = (n) => Math.round(n * 10000) / 10000;
+
+async function readBalance(env, userId) {
+  const result = await supabaseRequest(
+    env,
+    `${USERS_TABLE}?select=${USERS_BALANCE_COLUMN}` +
+      `&${USERS_ID_COLUMN}=eq.${encodeURIComponent(userId)}&limit=1`
+  );
+
+  if (!Array.isArray(result.data) || result.data.length === 0) return null;
+
+  return Number(result.data[0][USERS_BALANCE_COLUMN]) || 0;
+}
+
+// Compare-and-swap: only applies if the balance is still what we read,
+// so two simultaneous runs can't spend the same credit.
+async function setBalanceIfUnchanged(env, userId, oldBalance, newBalance) {
+  const result = await supabaseRequest(
+    env,
+    `${USERS_TABLE}` +
+      `?${USERS_ID_COLUMN}=eq.${encodeURIComponent(userId)}` +
+      `&${USERS_BALANCE_COLUMN}=eq.${oldBalance}`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ [USERS_BALANCE_COLUMN]: newBalance }),
+    }
+  );
+
+  return Array.isArray(result.data) && result.data.length > 0
+    ? newBalance
+    : null;
+}
+
+// Deducts `amount`. Returns { ok, balance }.
+async function chargeCredits(env, userId, amount) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const balance = await readBalance(env, userId);
+
+    if (balance === null || balance < amount - 1e-9) {
+      return { ok: false, balance: balance || 0 };
+    }
+
+    const result = await setBalanceIfUnchanged(
+      env,
+      userId,
+      balance,
+      round4(balance - amount)
+    );
+
+    if (result !== null) return { ok: true, balance: result };
+  }
+
+  throw new Error("Could not update credits. Please retry.");
+}
+
+// Gives the credit back (no lead was saved).
+async function refundCredits(env, userId, amount) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const balance = await readBalance(env, userId);
+      if (balance === null) return;
+
+      const result = await setBalanceIfUnchanged(
+        env,
+        userId,
+        balance,
+        round4(balance + amount)
+      );
+
+      if (result !== null) return;
+    } catch (error) {
+      console.error("Refund error:", error.message);
+    }
+  }
+
+  console.error("Refund failed after retries for user", userId);
+}
+
 // ============================================================
 // PROCESS ONE TASK
 // ============================================================
 
 async function processOneTask(env) {
-  const task = await findOldestPendingTask(env);
+  const claim = await claimNextEligibleTask(env);
 
-  if (!task) {
+  if (!claim.task) {
     return {
       ok: true,
       processed: false,
-      message: "No pending outreach tasks",
+      message: "No eligible applications. Nothing was done.",
+      ...claim.summary,
     };
   }
 
-  const claimed = await claimTask(env, task);
-
-  if (!claimed) {
-    return {
-      ok: true,
-      processed: false,
-      message: "Task was already claimed",
-      task_id: task.id,
-    };
-  }
+  const task = claim.task;
+  let leadSaved = false;
 
   try {
     const result = await findAndSaveOneLead(env, task);
 
     if (!result.saved) {
+      await refundCredits(env, task.user_id, CREDIT_COST);
       await releaseTask(env, task.id, result.reason);
 
       return {
@@ -148,8 +283,11 @@ async function processOneTask(env) {
         task_id: task.id,
         reason: result.reason,
         pending_count_unchanged: true,
+        credits_charged: 0,
       };
     }
+
+    leadSaved = true;
 
     const updatedTask = await decrementPendingCount(env, task);
 
@@ -160,35 +298,161 @@ async function processOneTask(env) {
       lead: result.lead,
       pending_count: updatedTask.pending_count,
       status: updatedTask.status,
+      credits_charged: CREDIT_COST,
     };
   } catch (error) {
+    // Credits are only kept when a lead was actually saved.
+    if (!leadSaved) {
+      await refundCredits(env, task.user_id, CREDIT_COST);
+    }
+
     await releaseTask(env, task.id, error.message);
     throw error;
   }
 }
 
 // ============================================================
-// FIND OLDEST PENDING OUTREACH TASK
+// FIND, CHARGE AND CLAIM THE NEXT ELIGIBLE TASK
 // ============================================================
 
-async function findOldestPendingTask(env) {
-  const query =
+async function claimNextEligibleTask(env) {
+  const now = Date.now();
+  const backoffAfter = now - ATTEMPT_BACKOFF_MINUTES * 60 * 1000;
+  const cooldownCutoff = new Date(
+    now - LEAD_COOLDOWN_HOURS * 60 * 60 * 1000
+  ).toISOString();
+
+  const summary = {
+    applications_considered: 0,
+    skipped_backoff: 0,
+    skipped_insufficient_credits: 0,
+    skipped_cooldown: 0,
+  };
+
+  // 1. Pending tasks, oldest first.
+  const tasksResult = await supabaseRequest(
+    env,
     "planner_runs" +
-    "?select=*" +
-    "&source=eq.outreach" +
-    "&worker_type=eq.cold_outreach" +
-    "&status=eq.pending" +
-    "&pending_count=gt.0" +
-    "&order=created_at.asc" +
-    "&limit=1";
+      "?select=*" +
+      "&source=eq.outreach" +
+      "&worker_type=eq.cold_outreach" +
+      "&status=eq.pending" +
+      "&pending_count=gt.0" +
+      "&order=created_at.asc" +
+      `&limit=${MAX_CANDIDATE_TASKS}`
+  );
 
-  const result = await supabaseRequest(env, query);
+  const tasks = Array.isArray(tasksResult.data) ? tasksResult.data : [];
 
-  if (!Array.isArray(result.data) || result.data.length === 0) {
-    return null;
+  // One task per application (the oldest one).
+  const byApplication = new Map();
+
+  for (const task of tasks) {
+    if (!task.user_id || !task.application_id) continue;
+
+    if (
+      task.started_at &&
+      new Date(task.started_at).getTime() > backoffAfter
+    ) {
+      summary.skipped_backoff += 1;
+      continue;
+    }
+
+    const key = String(task.application_id);
+
+    if (!byApplication.has(key)) {
+      byApplication.set(key, task);
+    }
   }
 
-  return result.data[0];
+  summary.applications_considered = byApplication.size;
+
+  if (byApplication.size === 0) {
+    return { task: null, summary };
+  }
+
+  // 2. Balances.
+  const userIds = [
+    ...new Set(
+      [...byApplication.values()].map((t) => String(t.user_id).toLowerCase())
+    ),
+  ];
+
+  const balanceRows = await fetchInChunks(
+    env,
+    `${USERS_TABLE}?select=${USERS_ID_COLUMN},${USERS_BALANCE_COLUMN}`,
+    USERS_ID_COLUMN,
+    userIds
+  );
+
+  const balances = new Map(
+    balanceRows.map((row) => [
+      String(row[USERS_ID_COLUMN]).toLowerCase(),
+      Number(row[USERS_BALANCE_COLUMN]) || 0,
+    ])
+  );
+
+  const funded = [];
+
+  for (const [applicationId, task] of byApplication) {
+    const balance = balances.get(String(task.user_id).toLowerCase()) ?? 0;
+
+    if (balance < CREDIT_COST - 1e-9) {
+      summary.skipped_insufficient_credits += 1;
+      continue;
+    }
+
+    funded.push([applicationId, task]);
+  }
+
+  if (funded.length === 0) {
+    return { task: null, summary };
+  }
+
+  // 3. Cooldown: any lead created in the last 12 hours blocks the application.
+  const recentLeads = await fetchInChunks(
+    env,
+    "leads?select=application_id" +
+      `&created_at=gte.${encodeURIComponent(cooldownCutoff)}`,
+    "application_id",
+    funded.map(([applicationId]) => applicationId)
+  );
+
+  const blocked = new Set(
+    recentLeads.map((row) => String(row.application_id))
+  );
+
+  const eligible = [];
+
+  for (const [applicationId, task] of funded) {
+    if (blocked.has(applicationId)) {
+      summary.skipped_cooldown += 1;
+      continue;
+    }
+
+    eligible.push(task);
+  }
+
+  // 4. Oldest task first (tasks were already fetched oldest first).
+  for (const task of eligible) {
+    const charge = await chargeCredits(env, task.user_id, CREDIT_COST);
+
+    if (!charge.ok) {
+      summary.skipped_insufficient_credits += 1;
+      continue;
+    }
+
+    const claimed = await claimTask(env, task);
+
+    if (claimed) {
+      return { task, summary };
+    }
+
+    // Another run took this task: give the credit back and try the next.
+    await refundCredits(env, task.user_id, CREDIT_COST);
+  }
+
+  return { task: null, summary };
 }
 
 // ============================================================
@@ -216,6 +480,9 @@ async function claimTask(env, task) {
 
 // ============================================================
 // RELEASE TASK FOR RETRY
+//
+// started_at is left as the claim time, which is what makes the
+// 30-minute attempt backoff work.
 // ============================================================
 
 async function releaseTask(env, taskId, reason) {
@@ -411,7 +678,7 @@ async function findAndSaveOneLead(env, task) {
     };
   }
 
-  // Try companies one by one until a new email is saved.
+  // Try companies one by one until a new VERIFIED email is saved.
   // Hunter only charges when emails are actually returned, so empty
   // searches are free. MAX_DOMAIN_SEARCHES caps the total calls per run.
   let searches = 0;
@@ -445,9 +712,10 @@ async function findAndSaveOneLead(env, task) {
         break;
       }
 
+      // Only verified emails are allowed.
       const candidates = extractEmailCandidates(domainResult)
         .filter((candidate) => isValidEmail(candidate.email))
-        .filter((candidate) => !isBadStatus(candidate.email_status))
+        .filter((candidate) => isVerifiedStatus(candidate.email_status))
         .sort(
           (a, b) => scoreCandidate(b, filters) - scoreCandidate(a, filters)
         );
@@ -471,6 +739,7 @@ async function findAndSaveOneLead(env, task) {
             saved: true,
             lead: {
               email: lead.email,
+              email_status: lead.email_status,
               full_name: lead.full_name,
               job_title: lead.job_title,
               company_name: lead.company_name,
@@ -490,7 +759,7 @@ async function findAndSaveOneLead(env, task) {
   return {
     saved: false,
     reason:
-      `No new email found after ${searches} Domain Search call(s). ` +
+      `No new verified email found after ${searches} Domain Search call(s). ` +
       `Tried: ${tried.join(", ")}`,
   };
 }
@@ -940,9 +1209,11 @@ function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
 }
 
-function isBadStatus(status) {
-  const value = String(status || "").toLowerCase();
-  return value === "invalid" || value === "disposable";
+// Only verified emails are allowed. Hunter statuses such as
+// "accept_all", "unknown", "webmail", "invalid" and "disposable",
+// and emails with no verification status, are all rejected.
+function isVerifiedStatus(status) {
+  return VERIFIED_STATUSES.includes(String(status || "").trim().toLowerCase());
 }
 
 function joinName(first, last) {
@@ -957,10 +1228,6 @@ function scoreCandidate(candidate, filters) {
   let score = 0;
 
   const title = String(candidate.job_title || "").toLowerCase();
-  const status = String(candidate.email_status || "").toLowerCase();
-
-  if (status === "valid" || status === "verified") score += 10;
-  if (status === "accept_all" || status === "webmail") score += 2;
 
   // Match against the recommended job titles from the task.
   for (const wanted of filters.jobTitles) {
@@ -1142,4 +1409,4 @@ function json(data, status = 200) {
       "Cache-Control": "no-store",
     },
   });
-        }
+}
